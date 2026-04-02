@@ -7,6 +7,7 @@
 <h3 align="center">Claude Code's compaction engine, as a drop-in DeepAgents middleware.</h3>
 
 <p align="center">
+  <a href="https://pypi.org/project/compact-middleware"><img src="https://img.shields.io/pypi/v/compact-middleware?style=flat-square&color=blue" alt="PyPI"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue?style=flat-square" alt="License"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.11+-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"></a>
   <a href="https://github.com/langchain-ai/deepagents"><img src="https://img.shields.io/badge/DeepAgents-compatible-4B32C3?style=flat-square" alt="DeepAgents"></a>
@@ -72,13 +73,10 @@ flowchart TD
 ### Install
 
 ```bash
-# From source (not yet on PyPI)
-pip install git+https://github.com/emanueleielo/compact-middleware.git
+pip install compact-middleware
 
-# Or local development
-git clone https://github.com/emanueleielo/compact-middleware.git
-cd compact-middleware
-pip install -e ".[dev]"
+# Or from source
+pip install git+https://github.com/emanueleielo/compact-middleware.git
 ```
 
 ### Minimal — zero config
