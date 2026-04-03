@@ -362,11 +362,7 @@ def format_compact_summary(summary: str) -> str:
     match = re.search(r"<summary>([\s\S]*?)</summary>", formatted)
     if match:
         content = match.group(1).strip()
-        formatted = re.sub(
-            r"<summary>[\s\S]*?</summary>",
-            f"Summary:\n{content}",
-            formatted,
-        )
+        formatted = formatted[:match.start()] + f"Summary:\n{content}" + formatted[match.end():]
 
     # Clean up extra whitespace
     formatted = re.sub(r"\n\n+", "\n\n", formatted)
