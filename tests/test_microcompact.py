@@ -73,7 +73,7 @@ def test_microcompact_skips_empty_ids() -> None:
     )
     old = datetime.now(UTC) - timedelta(hours=2)
     msgs = [
-        _make_ai_with_timestamp(old, [{"name": "read_file", "args": {}}]),  # no "id" key
+        _make_ai_with_timestamp(old, [{"name": "read_file", "args": {}, "id": ""}]),  # empty "id"
         ToolMessage(content="should not be cleared", tool_call_id=""),
     ]
     result, event = microcompact_messages(msgs, config)
