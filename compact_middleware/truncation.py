@@ -116,16 +116,12 @@ def _determine_truncate_cutoff(
 
     if keep_type == "messages":
         n = int(keep_value)
-        if len(messages) <= n:
-            return len(messages)
-        return len(messages) - n
+        return max(0, len(messages) - n)
 
     if keep_type == "fraction":
         if max_input_tokens is None:
             fallback = 20
-            if len(messages) <= fallback:
-                return len(messages)
-            return len(messages) - fallback
+            return max(0, len(messages) - fallback)
         target = int(max_input_tokens * keep_value)
         tokens_kept = 0
         for i in range(len(messages) - 1, -1, -1):
@@ -177,7 +173,7 @@ def truncate_args(
         return messages, False
 
     cutoff = _determine_truncate_cutoff(messages, config.keep, max_input_tokens)
-    if cutoff >= len(messages):
+    if cutoff <= 0:
         return messages, False
 
     result: list[AnyMessage] = []
