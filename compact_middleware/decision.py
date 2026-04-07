@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from langchain_core.messages import AIMessage, AnyMessage, SystemMessage
+from langchain_core.messages import AIMessage, AnyMessage, SystemMessage, ToolMessage
 from langchain_core.tools import BaseTool
 
 from compact_middleware.collapse import collapse_messages
@@ -148,10 +148,14 @@ def evaluate(
 ) -> DecisionResult:
     """Run the multi-level decision cascade.
 
-    Evaluates each compaction level in order. Lightweight levels (collapse,
-    truncate, microcompact) are always applied when their conditions are met.
-    If token usage still exceeds the threshold after lightweight levels,
-    the engine signals that full or partial compaction is needed.
+    Lightweight levels (collapse, truncate, microcompact) run unconditionally
+    on every call — each has its own internal trigger conditions (time-based
+    gap, per-config threshold, group size, etc.).  This matches Claude Code's
+    ``query.ts`` where microcompact, tool-result budget, and context-collapse
+    all execute before the autocompact token check.
+
+    Only the expensive LLM-based compaction (full / partial) is gated behind
+    the global ``config.trigger`` token threshold.
 
     Args:
         messages: Current effective message list.
@@ -164,32 +168,9 @@ def evaluate(
     Returns:
         DecisionResult with modified messages and metadata.
     """
-    # Circuit breaker check
-    if consecutive_failures >= config.max_consecutive_failures:
-        logger.warning(
-            "Circuit breaker: %d consecutive failures >= %d, skipping auto-compaction",
-            consecutive_failures,
-            config.max_consecutive_failures,
-        )
-        return DecisionResult(
-            messages=messages,
-            level=CompactionLevel.NONE,
-            tokens_before=0,
-            tokens_after=0,
-        )
-
     # Estimate current tokens (hybrid: real API usage + heuristic for tail)
     counted = [system_message, *messages] if system_message is not None else list(messages)
     tokens_before = token_count_with_estimation(counted)
-
-    # Check if any trigger fires
-    if not should_trigger(messages, tokens_before, config.trigger, max_input_tokens):
-        return DecisionResult(
-            messages=messages,
-            level=CompactionLevel.NONE,
-            tokens_before=tokens_before,
-            tokens_after=tokens_before,
-        )
 
     current_messages = messages
     current_level = CompactionLevel.NONE
@@ -197,14 +178,18 @@ def evaluate(
     microcompact_event = None
     args_truncated = False
 
-    # Level 1: Collapse
+    # ------------------------------------------------------------------
+    # Lightweight levels — always run (each has its own internal triggers)
+    # ------------------------------------------------------------------
+
+    # Level 1: Collapse consecutive read/search groups
     collapsed, c_event = collapse_messages(current_messages, config.collapse)
     if c_event is not None:
         current_messages = collapsed
         current_level = CompactionLevel.COLLAPSE
         collapse_event = c_event
 
-    # Level 2: Truncate args
+    # Level 2: Truncate large tool-call arguments
     truncated, was_truncated = truncate_args(
         current_messages,
         system_message,
@@ -217,7 +202,7 @@ def evaluate(
         current_level = CompactionLevel.TRUNCATE
         args_truncated = True
 
-    # Level 3: Microcompact
+    # Level 3: Microcompact (time-based tool result clearing)
     microcompacted, mc_event = microcompact_messages(
         current_messages,
         config.microcompact,
@@ -231,7 +216,27 @@ def evaluate(
     counted_after = [system_message, *current_messages] if system_message is not None else list(current_messages)
     tokens_after = token_count_with_estimation(counted_after)
 
-    # Check if we still need full/partial compaction
+    # ------------------------------------------------------------------
+    # LLM-based compaction — only when token threshold is exceeded
+    # ------------------------------------------------------------------
+
+    # Circuit breaker: skip LLM compaction after N consecutive failures
+    if consecutive_failures >= config.max_consecutive_failures:
+        logger.warning(
+            "Circuit breaker: %d consecutive failures >= %d, skipping LLM compaction",
+            consecutive_failures,
+            config.max_consecutive_failures,
+        )
+        return DecisionResult(
+            messages=current_messages,
+            level=current_level,
+            tokens_before=tokens_before,
+            tokens_after=tokens_after,
+            collapse_event=collapse_event,
+            microcompact_event=microcompact_event,
+            args_truncated=args_truncated,
+        )
+
     still_over = should_trigger(
         current_messages, tokens_after, config.trigger, max_input_tokens,
     )
