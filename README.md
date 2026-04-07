@@ -44,14 +44,14 @@ Long-running AI agents hit the context window wall. The built-in `SummarizationM
 
 ## How It Works
 
-The middleware runs a **multi-level cascade** — cheapest fix first, LLM call only if needed:
+Lightweight levels run **every turn** (each with its own trigger), matching Claude Code's `query.ts` pipeline. The expensive LLM summarization only fires when tokens exceed the global threshold:
 
 ```mermaid
 flowchart TD
-    A["Context growing..."] --> B{"1. COLLAPSE"}
+    A["Every turn"] --> B{"1. COLLAPSE"}
     B -->|"Group consecutive read/search\ninto badge summaries"| C{"2. TRUNCATE"}
     C -->|"Shorten large tool args\nin old messages"| D{"3. MICROCOMPACT"}
-    D -->|"Clear stale tool results\n(time gap > 60 min)"| E{"Still over\nthreshold?"}
+    D -->|"Clear stale tool results\n(time gap > 60 min)"| E{"Token threshold\nexceeded?"}
     E -->|No| F["Done — no LLM call needed"]
     E -->|Yes| G{"4. SUMMARIZE"}
     G -->|"9-section structured summary\n+ restore files & plan"| H["Done"]
@@ -64,7 +64,7 @@ flowchart TD
     style G fill:#e63946,color:#fff
 ```
 
-> Levels 1-3 are **free** (no LLM call). In many cases they're enough to stay within budget.
+> Levels 1-3 are **free** (no LLM call) and run unconditionally — each has its own internal trigger (group size, arg length, time gap). Only level 4 is gated by the global token threshold.
 
 ---
 
