@@ -328,6 +328,27 @@ compact_middleware/
 └── state.py           State schema (TypedDict events)
 ```
 
+### State persistence
+
+Compaction state — the cutoff index, the summary message and the circuit-breaker
+counter — is written to LangGraph state through
+`ExtendedModelResponse(command=Command(update=…))`, under the private keys
+declared in `CompactionState`.
+
+**This means compaction state survives new middleware instances**, so it keeps
+working under per-request agent construction, ephemeral serverless workers and
+multi-process deployments.
+
+> **Requires a checkpointer.** Like any LangGraph state, compaction state only
+> outlives a single run if the agent is compiled with one:
+>
+> ```python
+> agent = create_deep_agent(middleware=[mw], checkpointer=InMemorySaver())
+> ```
+>
+> Without a checkpointer each run starts fresh and the conversation is
+> re-summarized from scratch.
+
 ## Development
 
 ```bash

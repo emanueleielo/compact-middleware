@@ -18,7 +18,7 @@ that bring token usage below the threshold. Includes:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -64,11 +64,35 @@ class DecisionResult:
     tokens_after: int
     """Estimated tokens after compaction levels applied (before full/partial)."""
 
+    source_map: list[int] = field(default_factory=list)
+    """Maps each index in ``messages`` to the index, in the list handed to
+    ``evaluate()``, of the last input message it accounts for.
+
+    Only the collapse level changes the message count; truncation and
+    microcompaction rewrite content in place.  Anything that persists an
+    index derived from ``messages`` — notably the compaction cutoff — must
+    translate it through this map first, or it will be off by the number of
+    messages collapse removed.
+    """
+
     collapse_event: CollapseEvent | None = None
     microcompact_event: MicrocompactEvent | None = None
     args_truncated: bool = False
     needs_full_compaction: bool = False
     needs_partial_compaction: bool = False
+
+    def to_source_index(self, index: int) -> int:
+        """Translate an exclusive cutoff in ``messages`` to the source list.
+
+        ``messages[:index]`` covers exactly ``source[:result]``.
+        """
+        if index <= 0:
+            return 0
+        if not self.source_map:
+            return index
+        if index >= len(self.source_map):
+            return self.source_map[-1] + 1
+        return self.source_map[index - 1] + 1
 
 
 def get_max_input_tokens(model_profile: dict[str, Any] | None) -> int | None:
@@ -182,12 +206,16 @@ def evaluate(
     # Lightweight levels — always run (each has its own internal triggers)
     # ------------------------------------------------------------------
 
-    # Level 1: Collapse consecutive read/search groups
-    collapsed, c_event = collapse_messages(current_messages, config.collapse)
+    # Level 1: Collapse consecutive read/search groups.
+    # This is the only level that changes the message count, so its source
+    # map is what later levels (and the caller) index through.
+    collapsed, c_event, source_map = collapse_messages(current_messages, config.collapse)
     if c_event is not None:
         current_messages = collapsed
         current_level = CompactionLevel.COLLAPSE
         collapse_event = c_event
+    else:
+        source_map = list(range(len(current_messages)))
 
     # Level 2: Truncate large tool-call arguments
     truncated, was_truncated = truncate_args(
@@ -232,6 +260,7 @@ def evaluate(
             level=current_level,
             tokens_before=tokens_before,
             tokens_after=tokens_after,
+            source_map=source_map,
             collapse_event=collapse_event,
             microcompact_event=microcompact_event,
             args_truncated=args_truncated,
@@ -257,6 +286,7 @@ def evaluate(
         level=current_level,
         tokens_before=tokens_before,
         tokens_after=tokens_after,
+        source_map=source_map,
         collapse_event=collapse_event,
         microcompact_event=microcompact_event,
         args_truncated=args_truncated,

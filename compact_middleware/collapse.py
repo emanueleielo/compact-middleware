@@ -189,7 +189,7 @@ def _build_collapse_badge(messages: list[AnyMessage], start: int, end: int) -> s
 def collapse_messages(
     messages: list[AnyMessage],
     config: CollapseConfig,
-) -> tuple[list[AnyMessage], CollapseEvent | None]:
+) -> tuple[list[AnyMessage], CollapseEvent | None, list[int]]:
     """Collapse consecutive read/search tool groups into summary messages.
 
     Each group of consecutive collapsible tool pairs (AIMessage + ToolMessage)
@@ -200,23 +200,32 @@ def collapse_messages(
         config: Collapse configuration.
 
     Returns:
-        Tuple of (possibly collapsed messages, event or None).
+        Tuple of (possibly collapsed messages, event or None, source map).
+
+        The source map has one entry per *output* message holding the index,
+        in the input list, of the last input message that output message
+        accounts for.  Callers that need to translate an index in the
+        collapsed list back into an index in the original list — e.g. to
+        persist a compaction cutoff — must go through this map, since
+        collapsing shortens the list.
     """
     if not config.enabled:
-        return messages, None
+        return messages, None, list(range(len(messages)))
 
     groups = _find_collapsible_groups(messages, config.collapse_tools, config.min_group_size)
 
     if not groups:
-        return messages, None
+        return messages, None, list(range(len(messages)))
 
     result: list[AnyMessage] = []
+    source_map: list[int] = []
     total_collapsed = 0
     prev_end = 0
 
     for start, end in groups:
         # Add messages before this group
         result.extend(messages[prev_end:start])
+        source_map.extend(range(prev_end, start))
 
         # Build collapsed summary
         badge = _build_collapse_badge(messages, start, end)
@@ -233,21 +242,27 @@ def collapse_messages(
                 content=f"[{badge} — {group_size} tool calls collapsed to save context]",
                 additional_kwargs={"lc_source": "compaction_collapse"},
             ))
+            # The badge stands in for everything up to (but excluding) the
+            # last pair, which is kept verbatim right after it.
+            source_map.append(end - 3)
             # Keep the last pair
             result.append(last_ai)
             result.append(last_tool)
+            source_map.extend((end - 2, end - 1))
             total_collapsed += group_size - 1
         else:
             # Group too small after filtering, keep as-is
             result.extend(messages[start:end])
+            source_map.extend(range(start, end))
 
         prev_end = end
 
     # Add remaining messages after last group
     result.extend(messages[prev_end:])
+    source_map.extend(range(prev_end, len(messages)))
 
     if total_collapsed == 0:
-        return messages, None
+        return messages, None, list(range(len(messages)))
 
     event = CollapseEvent(
         groups_collapsed=len(groups),
@@ -260,4 +275,4 @@ def collapse_messages(
         total_collapsed,
     )
 
-    return result, event
+    return result, event, source_map
