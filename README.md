@@ -27,6 +27,9 @@ Long-running AI agents hit the context window wall. The built-in `SummarizationM
 
 **compact-middleware** takes the battle-tested compaction pipeline from [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and makes it a composable [DeepAgents](https://github.com/langchain-ai/deepagents) middleware. One import, and your agents handle **10x longer conversations** without blowing the context window.
 
+
+Created and maintained by [Emanuele Ielo](https://github.com/emanueleielo) ([LinkedIn](https://www.linkedin.com/in/emanuele-ielo/)), AI Engineer and Forward Deployed Engineer based in Rome, Italy. Also the author of [CianaParrot](https://github.com/emanueleielo/ciana-parrot) and [advisor-middleware](https://github.com/emanueleielo/advisor-middleware).
+
 ---
 
 ## The Problem
