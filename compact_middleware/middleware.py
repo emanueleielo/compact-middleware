@@ -6,26 +6,31 @@
 These follow the DeepAgents ``AgentMiddleware`` protocol and are drop-in
 replacements for the built-in ``SummarizationMiddleware``.
 
-**Compatibility note**: LangChain 1.2.x's agent factory ignores
-``Command(update={...})`` returned by middleware, so this implementation
-stores compaction state on the middleware *instance* (keyed by thread ID)
-rather than relying on LangGraph state updates. The LLM always sees the
-compacted message view; the raw state keeps growing but is never sent to
-the model.
+**State handling**: compaction state (cutoff index, summary message,
+circuit-breaker counter) is persisted in LangGraph state via
+``ExtendedModelResponse(command=Command(update={...}))``, using the private
+keys declared in :class:`~compact_middleware.state.CompactionState`.  It
+therefore survives new middleware instances, ephemeral workers and multiple
+processes, as long as the agent is compiled with a checkpointer.  The LLM
+always sees the compacted message view; the raw message list in state keeps
+growing but is never sent to the model.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import threading
 import uuid
 import warnings
-from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
 
-from langchain.agents.middleware.types import AgentMiddleware, AgentState
+from langchain.agents.middleware.types import (
+    AgentMiddleware,
+    AgentState,
+    ExtendedModelResponse,
+)
 from langchain.tools import ToolRuntime
 
 try:
@@ -71,36 +76,35 @@ from compact_middleware.tokens import estimate_tokens, token_count_with_estimati
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+    from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
     from langchain.agents.middleware.types import ModelRequest, ModelResponse
     from langchain.chat_models import BaseChatModel
     from langchain_core.runnables.config import RunnableConfig
     from langchain_core.tools import BaseTool
     from langgraph.runtime import Runtime
 
-    from deepagents.backends.protocol import BACKEND_TYPES, BackendProtocol
-
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Instance-level compaction state (bypasses broken Command(update={}))
+# Compaction state accessors (persisted in LangGraph state)
 # ---------------------------------------------------------------------------
 
 
-@dataclass
-class _ThreadCompactionState:
-    """Per-thread compaction state stored on the middleware instance.
+def _read_event(state: Mapping[str, Any] | None) -> CompactionEvent | None:
+    """Read the last compaction event out of LangGraph state."""
+    if not state:
+        return None
+    event = state.get("_compaction_event")
+    return event if isinstance(event, dict) else None
 
-    LangChain 1.2.x does not process ``Command(update={...})`` returned
-    from middleware, so we track compaction state here instead of in
-    LangGraph's agent state.
-    """
 
-    event: CompactionEvent | None = None
-    """Last compaction event (cutoff index + summary message)."""
-
-    failures: int = 0
-    """Consecutive auto-compaction failures (circuit breaker)."""
+def _read_failures(state: Mapping[str, Any] | None) -> int:
+    """Read the circuit-breaker counter out of LangGraph state."""
+    if not state:
+        return 0
+    failures = state.get("_compaction_failures", 0)
+    return failures if isinstance(failures, int) else 0
 
 
 # ---------------------------------------------------------------------------
@@ -138,11 +142,14 @@ class CompactionMiddleware(AgentMiddleware):
     middleware architecture.  Replaces the built-in ``SummarizationMiddleware``.
 
     **State handling**: compaction metadata (cutoff, summary, failure count)
-    is stored on the middleware *instance* rather than in LangGraph state.
-    This is necessary because LangChain 1.2.x ignores ``Command(update=…)``
-    returned from ``wrap_model_call``.  The raw message list in LangGraph
-    state keeps growing, but the middleware always reconstructs the compacted
-    "effective" view before passing messages to the LLM.
+    is persisted in LangGraph state through
+    ``ExtendedModelResponse(command=Command(update=…))``.  The raw message
+    list in state keeps growing, but the middleware always reconstructs the
+    compacted "effective" view before passing messages to the LLM.
+
+    Persistence across processes requires the agent to be compiled with a
+    checkpointer; without one, LangGraph state — and therefore compaction
+    state — lives only for the duration of a single run.
 
     Usage::
 
@@ -175,46 +182,27 @@ class CompactionMiddleware(AgentMiddleware):
             getattr(model, "profile", None)
         )
 
-        # Per-thread compaction state (keyed by thread_id).
-        # Protected by a lock for safety across concurrent async tasks.
-        self._lock = threading.Lock()
-        self._thread_states: dict[str, _ThreadCompactionState] = {}
-
         # Stable fallback ID when no thread_id is in the LangGraph config.
-        # Generated once at init so every call within the same middleware
-        # instance maps to the same compaction state.
+        # Only used to name the offloaded transcript; compaction state itself
+        # lives in LangGraph state and is keyed by the graph's own thread.
         self._fallback_thread_id = f"session_{uuid.uuid4().hex[:8]}"
 
     @property
     def config(self) -> CompactionConfig:
         return self._config
 
-    # --- Per-thread state helpers ---
+    # --- Compaction state updates ---
 
-    def _get_thread_state(self, thread_id: str) -> _ThreadCompactionState:
-        with self._lock:
-            if thread_id not in self._thread_states:
-                self._thread_states[thread_id] = _ThreadCompactionState()
-            return self._thread_states[thread_id]
-
-    def _save_compaction_event(
-        self,
-        thread_id: str,
-        event: CompactionEvent,
-    ) -> None:
-        with self._lock:
-            ts = self._thread_states.setdefault(
-                thread_id, _ThreadCompactionState()
-            )
-            ts.event = event
-            ts.failures = 0  # reset on success
-
-    def _increment_failures(self, thread_id: str) -> None:
-        with self._lock:
-            ts = self._thread_states.setdefault(
-                thread_id, _ThreadCompactionState()
-            )
-            ts.failures += 1
+    @staticmethod
+    def _state_update(
+        event: CompactionEvent | None = None,
+        failures: int = 0,
+    ) -> Command:
+        """Build the LangGraph state update carrying compaction state."""
+        update: dict[str, Any] = {"_compaction_failures": failures}
+        if event is not None:
+            update["_compaction_event"] = event
+        return Command(update=update)
 
     # --- Backend resolution ---
 
@@ -398,7 +386,29 @@ class CompactionMiddleware(AgentMiddleware):
 
     # --- Cutoff determination ---
 
+    @staticmethod
+    def _align_cutoff_to_tool_boundary(
+        messages: list[AnyMessage],
+        cutoff: int,
+    ) -> int:
+        """Move a cutoff back so the kept tail never starts on a ToolMessage.
+
+        Summarizing an ``AIMessage`` that carries ``tool_calls`` while keeping
+        its ``ToolMessage`` replies leaves those replies orphaned, which most
+        providers reject outright.  Walking backwards keeps the whole tool
+        block on the un-summarized side.
+        """
+        if cutoff <= 0 or cutoff >= len(messages):
+            return cutoff
+        while cutoff > 0 and isinstance(messages[cutoff], ToolMessage):
+            cutoff -= 1
+        return cutoff
+
     def _determine_cutoff_index(self, messages: list[AnyMessage]) -> int:
+        cutoff = self._raw_cutoff_index(messages)
+        return self._align_cutoff_to_tool_boundary(messages, cutoff)
+
+    def _raw_cutoff_index(self, messages: list[AnyMessage]) -> int:
         keep_type, keep_value = self._config.keep
 
         if keep_type == "messages":
@@ -467,19 +477,20 @@ class CompactionMiddleware(AgentMiddleware):
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], ModelResponse],
-    ) -> ModelResponse:
+    ) -> ModelResponse | ExtendedModelResponse:
         """Process messages before model call with multi-level compaction.
 
-        1. Reconstruct effective messages from instance-level compaction state
+        1. Reconstruct effective messages from the persisted compaction event
         2. Run lightweight cascade (collapse, truncate, microcompact)
         3. If still over threshold: full/partial LLM compaction
         4. On ContextOverflowError: fallback to compaction
         5. Call handler with the (possibly compacted) messages
         """
         thread_id = self._get_thread_id()
-        ts = self._get_thread_state(thread_id)
+        prior_event = _read_event(request.state)
+        failures = _read_failures(request.state)
 
-        effective = self._apply_event_to_messages(request.messages, ts.event)
+        effective = self._apply_event_to_messages(request.messages, prior_event)
 
         decision = evaluate(
             effective,
@@ -487,7 +498,7 @@ class CompactionMiddleware(AgentMiddleware):
             request.tools,
             self._config,
             self._max_input_tokens,
-            ts.failures,
+            failures,
         )
 
         # No full compaction needed — try the call with lightweight fixes
@@ -500,11 +511,12 @@ class CompactionMiddleware(AgentMiddleware):
                     level=CompactionLevel.FULL,
                     tokens_before=decision.tokens_before,
                     tokens_after=decision.tokens_after,
+                    source_map=decision.source_map,
                     needs_full_compaction=True,
                 )
 
         return self._perform_compaction_sync(
-            request, handler, decision, ts.event, thread_id
+            request, handler, decision, prior_event, failures, thread_id
         )
 
     # ======================================================================
@@ -515,12 +527,13 @@ class CompactionMiddleware(AgentMiddleware):
         self,
         request: ModelRequest,
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
-    ) -> ModelResponse:
+    ) -> ModelResponse | ExtendedModelResponse:
         """Async version of wrap_model_call."""
         thread_id = self._get_thread_id()
-        ts = self._get_thread_state(thread_id)
+        prior_event = _read_event(request.state)
+        failures = _read_failures(request.state)
 
-        effective = self._apply_event_to_messages(request.messages, ts.event)
+        effective = self._apply_event_to_messages(request.messages, prior_event)
 
         decision = evaluate(
             effective,
@@ -528,7 +541,7 @@ class CompactionMiddleware(AgentMiddleware):
             request.tools,
             self._config,
             self._max_input_tokens,
-            ts.failures,
+            failures,
         )
 
         if not decision.needs_full_compaction and not decision.needs_partial_compaction:
@@ -542,11 +555,12 @@ class CompactionMiddleware(AgentMiddleware):
                     level=CompactionLevel.FULL,
                     tokens_before=decision.tokens_before,
                     tokens_after=decision.tokens_after,
+                    source_map=decision.source_map,
                     needs_full_compaction=True,
                 )
 
         return await self._perform_compaction_async(
-            request, handler, decision, ts.event, thread_id
+            request, handler, decision, prior_event, failures, thread_id
         )
 
     # ======================================================================
@@ -559,8 +573,9 @@ class CompactionMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], ModelResponse],
         decision: DecisionResult,
         prior_event: CompactionEvent | None,
+        failures: int,
         thread_id: str,
-    ) -> ModelResponse:
+    ) -> ModelResponse | ExtendedModelResponse:
         messages = decision.messages
         cutoff = self._determine_cutoff_index(messages)
 
@@ -599,8 +614,10 @@ class CompactionMiddleware(AgentMiddleware):
                 strategy = "full"
         except Exception:
             logger.exception("Compaction failed")
-            self._increment_failures(thread_id)
-            return handler(request.override(messages=messages))
+            return ExtendedModelResponse(
+                model_response=handler(request.override(messages=messages)),
+                command=self._state_update(prior_event, failures + 1),
+            )
 
         # Post-compaction restoration
         restoration = build_restoration_context(
@@ -611,22 +628,22 @@ class CompactionMiddleware(AgentMiddleware):
         )
         new_messages = self._enrich_summary(new_messages, restoration, file_path)
 
-        # Save compaction state on the instance
-        state_cutoff = self._compute_state_cutoff(prior_event, cutoff)
-        self._save_compaction_event(
-            thread_id,
-            CompactionEvent(
-                cutoff_index=state_cutoff,
-                summary_message=(
-                    new_messages[0]
-                    if new_messages
-                    else HumanMessage(content="[compaction failed]")
-                ),
-                file_path=file_path,
-                strategy=strategy,
-                tokens_before=decision.tokens_before,
-                tokens_after=estimate_tokens(new_messages),
+        # Persist compaction state. The cutoff indexes ``decision.messages``,
+        # which collapse may have shortened, so translate it back to the
+        # effective list before mapping it onto absolute state indices.
+        effective_cutoff = decision.to_source_index(cutoff)
+        state_cutoff = self._compute_state_cutoff(prior_event, effective_cutoff)
+        event = CompactionEvent(
+            cutoff_index=state_cutoff,
+            summary_message=(
+                new_messages[0]
+                if new_messages
+                else HumanMessage(content="[compaction failed]")
             ),
+            file_path=file_path,
+            strategy=strategy,
+            tokens_before=decision.tokens_before,
+            tokens_after=estimate_tokens(new_messages),
         )
 
         logger.info(
@@ -637,7 +654,10 @@ class CompactionMiddleware(AgentMiddleware):
             thread_id,
         )
 
-        return handler(request.override(messages=new_messages))
+        return ExtendedModelResponse(
+            model_response=handler(request.override(messages=new_messages)),
+            command=self._state_update(event, 0),
+        )
 
     async def _perform_compaction_async(
         self,
@@ -645,8 +665,9 @@ class CompactionMiddleware(AgentMiddleware):
         handler: Callable[[ModelRequest], Awaitable[ModelResponse]],
         decision: DecisionResult,
         prior_event: CompactionEvent | None,
+        failures: int,
         thread_id: str,
-    ) -> ModelResponse:
+    ) -> ModelResponse | ExtendedModelResponse:
         messages = decision.messages
         cutoff = self._determine_cutoff_index(messages)
 
@@ -687,8 +708,12 @@ class CompactionMiddleware(AgentMiddleware):
                 strategy = "full"
         except Exception:
             logger.exception("Compaction failed")
-            self._increment_failures(thread_id)
-            return await handler(request.override(messages=messages))
+            return ExtendedModelResponse(
+                model_response=await handler(
+                    request.override(messages=messages)
+                ),
+                command=self._state_update(prior_event, failures + 1),
+            )
 
         if file_path is None:
             warnings.warn(
@@ -705,21 +730,21 @@ class CompactionMiddleware(AgentMiddleware):
         )
         new_messages = self._enrich_summary(new_messages, restoration, file_path)
 
-        state_cutoff = self._compute_state_cutoff(prior_event, cutoff)
-        self._save_compaction_event(
-            thread_id,
-            CompactionEvent(
-                cutoff_index=state_cutoff,
-                summary_message=(
-                    new_messages[0]
-                    if new_messages
-                    else HumanMessage(content="[compaction failed]")
-                ),
-                file_path=file_path,
-                strategy=strategy,
-                tokens_before=decision.tokens_before,
-                tokens_after=estimate_tokens(new_messages),
+        # See the sync path: the cutoff must be translated out of the
+        # collapsed list before it becomes an absolute state index.
+        effective_cutoff = decision.to_source_index(cutoff)
+        state_cutoff = self._compute_state_cutoff(prior_event, effective_cutoff)
+        event = CompactionEvent(
+            cutoff_index=state_cutoff,
+            summary_message=(
+                new_messages[0]
+                if new_messages
+                else HumanMessage(content="[compaction failed]")
             ),
+            file_path=file_path,
+            strategy=strategy,
+            tokens_before=decision.tokens_before,
+            tokens_after=estimate_tokens(new_messages),
         )
 
         logger.info(
@@ -730,7 +755,12 @@ class CompactionMiddleware(AgentMiddleware):
             thread_id,
         )
 
-        return await handler(request.override(messages=new_messages))
+        return ExtendedModelResponse(
+            model_response=await handler(
+                request.override(messages=new_messages)
+            ),
+            command=self._state_update(event, 0),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -806,23 +836,28 @@ class CompactionToolMiddleware(AgentMiddleware):
         return False
 
     @staticmethod
-    def _tool_message(tool_call_id: str, text: str) -> Command:
-        return Command(
-            update={
-                "messages": [
-                    ToolMessage(content=text, tool_call_id=tool_call_id)
-                ],
-            }
-        )
+    def _tool_message(
+        tool_call_id: str,
+        text: str,
+        event: CompactionEvent | None = None,
+    ) -> Command:
+        update: dict[str, Any] = {
+            "messages": [ToolMessage(content=text, tool_call_id=tool_call_id)],
+        }
+        if event is not None:
+            # Manual compaction succeeded — persist it and clear the breaker.
+            update["_compaction_event"] = event
+            update["_compaction_failures"] = 0
+        return Command(update=update)
 
     def _run_compact(self, runtime: ToolRuntime) -> Command:
         c = self._compaction
         tool_call_id = runtime.tool_call_id or ""
         thread_id = c._get_thread_id()
-        ts = c._get_thread_state(thread_id)
+        prior_event = _read_event(runtime.state)
 
         messages = runtime.state.get("messages", [])
-        effective = c._apply_event_to_messages(messages, ts.event)
+        effective = c._apply_event_to_messages(messages, prior_event)
 
         if not self._is_eligible_for_compaction(effective):
             return self._tool_message(
@@ -870,32 +905,32 @@ class CompactionToolMiddleware(AgentMiddleware):
             )
 
         # Save on instance state
-        state_cutoff = c._compute_state_cutoff(ts.event, cutoff)
-        c._save_compaction_event(
-            thread_id,
-            CompactionEvent(
-                cutoff_index=state_cutoff,
-                summary_message=new_messages[0],
-                file_path=file_path,
-                strategy="full",
-                tokens_before=estimate_tokens(effective),
-                tokens_after=estimate_tokens(new_messages),
-            ),
+        # The tool compacts ``effective`` directly, with no lightweight
+        # cascade in between, so the cutoff is already an effective index.
+        state_cutoff = c._compute_state_cutoff(prior_event, cutoff)
+        event = CompactionEvent(
+            cutoff_index=state_cutoff,
+            summary_message=new_messages[0],
+            file_path=file_path,
+            strategy="full",
+            tokens_before=estimate_tokens(effective),
+            tokens_after=estimate_tokens(new_messages),
         )
 
         return self._tool_message(
             tool_call_id,
             f"Conversation compacted. Summarized {len(to_summarize)} messages.",
+            event,
         )
 
     async def _arun_compact(self, runtime: ToolRuntime) -> Command:
         c = self._compaction
         tool_call_id = runtime.tool_call_id or ""
         thread_id = c._get_thread_id()
-        ts = c._get_thread_state(thread_id)
+        prior_event = _read_event(runtime.state)
 
         messages = runtime.state.get("messages", [])
-        effective = c._apply_event_to_messages(messages, ts.event)
+        effective = c._apply_event_to_messages(messages, prior_event)
 
         if not self._is_eligible_for_compaction(effective):
             return self._tool_message(
@@ -942,22 +977,22 @@ class CompactionToolMiddleware(AgentMiddleware):
                 f"Compaction failed: {type(exc).__name__}: {exc}",
             )
 
-        state_cutoff = c._compute_state_cutoff(ts.event, cutoff)
-        c._save_compaction_event(
-            thread_id,
-            CompactionEvent(
-                cutoff_index=state_cutoff,
-                summary_message=new_messages[0],
-                file_path=file_path,
-                strategy="full",
-                tokens_before=estimate_tokens(effective),
-                tokens_after=estimate_tokens(new_messages),
-            ),
+        # The tool compacts ``effective`` directly, with no lightweight
+        # cascade in between, so the cutoff is already an effective index.
+        state_cutoff = c._compute_state_cutoff(prior_event, cutoff)
+        event = CompactionEvent(
+            cutoff_index=state_cutoff,
+            summary_message=new_messages[0],
+            file_path=file_path,
+            strategy="full",
+            tokens_before=estimate_tokens(effective),
+            tokens_after=estimate_tokens(new_messages),
         )
 
         return self._tool_message(
             tool_call_id,
             f"Conversation compacted. Summarized {len(to_summarize)} messages.",
+            event,
         )
 
     def wrap_model_call(

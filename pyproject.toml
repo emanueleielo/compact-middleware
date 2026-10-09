@@ -36,6 +36,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    # ExtendedModelResponse — how middleware persists state from
+    # wrap_model_call — landed in the langchain 1.2 agent factory.
+    "langchain>=1.2",
     "langchain-core>=0.3",
     "langgraph>=0.4",
     "pydantic>=2",
